@@ -105,14 +105,102 @@ pub(crate) const MAX_FACES: u32 = 64;
 /// Found once per process (a walk of every installed font, or a question per
 /// script to CoreText) and reused by every window the app creates. The
 /// result depends on the machine and may be empty.
+/// This low-level API returns owned bytes for compatibility. [`crate::FontSetup`]
+/// uses read-only mappings when available to avoid retaining private copies.
 pub fn fallbacks() -> &'static [Fallback] {
     static FONTS: OnceLock<Vec<Fallback>> = OnceLock::new();
+    FONTS.get_or_init(|| {
+        #[cfg(windows)]
+        {
+            mapped_fallbacks()
+                .iter()
+                .map(|loaded| {
+                    let mut face = loaded.face.clone();
+                    if loaded.mapping.is_some() {
+                        face.bytes = loaded.bytes().to_vec();
+                    }
+                    face
+                })
+                .collect()
+        }
+        #[cfg(not(windows))]
+        {
+            #[cfg(target_os = "macos")]
+            let found = macos::load();
+            #[cfg(not(target_os = "macos"))]
+            let found = scan();
+            found.into_iter().map(adjusted).collect()
+        }
+    })
+}
+
+#[cfg(windows)]
+pub(crate) struct MappedFallback {
+    pub(crate) face: Fallback,
+    mapping: Option<FontMapping>,
+}
+
+#[cfg(windows)]
+impl MappedFallback {
+    pub(crate) fn from_found(found: Found) -> Self {
+        // A font replaced between scanning and mapping must retain the scanned
+        // snapshot and its matching metrics instead of mixing two versions.
+        let mapping =
+            FontMapping::open(&found.path).filter(|mapped| mapped.bytes.as_ref() == found.bytes);
+        let mut face = adjusted(found);
+        if mapping.is_some() {
+            // Metadata and metrics are retained, but egui borrows the mapping.
+            face.bytes = Vec::new();
+        }
+        Self { face, mapping }
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        self.mapping
+            .as_ref()
+            .map_or(&self.face.bytes, |mapped| mapped.bytes.as_ref())
+    }
+}
+
+#[cfg(windows)]
+struct FontMapping {
+    bytes: memmap2::Mmap,
+    // Keep sharing restrictions in force until after the view is unmapped.
+    _file: std::fs::File,
+}
+
+#[cfg(windows)]
+impl FontMapping {
+    #[allow(
+        unsafe_code,
+        reason = "a persistent read-only view avoids private font copies; the retained file denies in-place writes"
+    )]
+    fn open(path: &Path) -> Option<Self> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            // FILE_SHARE_READ | FILE_SHARE_DELETE. Replacement is safe;
+            // in-place writes must stay denied for every borrowed font slice.
+            .share_mode(0x1 | 0x4)
+            .open(path)
+            .ok()?;
+        // SAFETY: the read-only mapping is held with its file handle, which
+        // excludes existing and future writers for the mapping's lifetime.
+        // Replacing the path leaves this file object and its view unchanged.
+        let bytes = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+        Some(Self { bytes, _file: file })
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn mapped_fallbacks() -> &'static [MappedFallback] {
+    static FONTS: OnceLock<Vec<MappedFallback>> = OnceLock::new();
     FONTS.get_or_init(|| {
         #[cfg(target_os = "macos")]
         let found = macos::load();
         #[cfg(not(target_os = "macos"))]
         let found = scan();
-        found.into_iter().map(adjusted).collect()
+        found.into_iter().map(MappedFallback::from_found).collect()
     })
 }
 
@@ -1007,6 +1095,56 @@ pub(crate) mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn mapped_font_keeps_its_bytes_and_metrics_without_an_owned_copy() {
+        let temporary = tempfile::tempdir().expect("font directory");
+        let path = temporary.path().join("fixture.ttf");
+        let bytes = include_bytes!("../tests/fixtures/yi/YiTallLineGap.ttf");
+        std::fs::write(&path, bytes).expect("fixture file");
+        let loaded = MappedFallback::from_found(Found {
+            script: "yi",
+            bytes: bytes.to_vec(),
+            index: 0,
+            path: path.clone(),
+        });
+        assert!(loaded.mapping.is_some());
+        assert!(
+            loaded.face.bytes.is_empty(),
+            "no duplicate private font payload"
+        );
+        assert_eq!(loaded.bytes(), bytes);
+        assert_eq!(loaded.face.name, "fallback-yi");
+        assert_eq!(loaded.face.index, 0);
+        assert_eq!(loaded.face.scale, 1.0);
+        assert_eq!(loaded.face.y_offset_factor, baseline_offset(bytes, 0));
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+        drop(loaded);
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_ok());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn unavailable_or_replaced_font_mapping_keeps_the_scanned_snapshot() {
+        let temporary = tempfile::tempdir().expect("font directory");
+        let path = temporary.path().join("fixture.ttf");
+        let bytes = include_bytes!("../tests/fixtures/yi/YiTest.ttf");
+        for replaced in [false, true] {
+            if replaced {
+                std::fs::write(&path, b"replacement").expect("changed fixture file");
+            }
+            let loaded = MappedFallback::from_found(Found {
+                script: "yi",
+                bytes: bytes.to_vec(),
+                index: 0,
+                path: path.clone(),
+            });
+            assert!(loaded.mapping.is_none());
+            assert_eq!(loaded.face.bytes, bytes);
+            assert_eq!(loaded.bytes(), bytes);
+        }
+    }
 
     #[test]
     fn only_font_files_are_probed() {

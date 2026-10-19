@@ -76,6 +76,19 @@ fonts.
 `fastframe_fonts::system::fallbacks()` finds the faces once per process and
 reuses them for every window.
 
+On Windows, `FontSetup` retains read-only mappings of selected files instead of private
+copies of their complete contents. If mapping fails or the file changed after
+selection, the scanned bytes remain the fallback. Face selection, glyphs,
+metrics and family order are unchanged. The low-level `system::fallbacks()`
+API still returns owned `Vec<u8>` payloads for compatibility; callers requesting
+that API explicitly retain those copies. Mapping reduces retained private bytes,
+not all resident pages or GPU memory, and selection still reads the files during
+initial discovery.
+The read handles deny in-place writes while the app runs; path replacement is
+allowed and leaves the loaded snapshot intact. Close the app if a font updater
+needs to rewrite a selected file in place. Linux and macOS retain their existing
+owned fallback loading. See [Windows file-sharing semantics](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew).
+
 | Platform | How the face is chosen |
 | --- | --- |
 | macOS | CoreText names the face it draws each script with, in the language the user reads, and its cascade behind it. Faces epaint cannot draw (Apple's `hvgl` outlines in `PingFangUI.ttc`) are skipped for the next in the cascade. |

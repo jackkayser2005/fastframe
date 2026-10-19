@@ -216,17 +216,60 @@ impl FontSetup {
     /// for the platform's face; later calls reuse both.
     #[must_use]
     pub fn definitions(&self) -> FontDefinitions {
-        let fallbacks: &[system::Fallback] = if self.system_fallbacks {
-            system::fallbacks()
-        } else {
-            &[]
-        };
         let interface = match self.primary {
             Primary::System => system::interface(),
             #[cfg(feature = "inter")]
             Primary::Inter => None,
         };
-        self.definitions_with(fallbacks, interface)
+        #[cfg(windows)]
+        let fallbacks = if self.system_fallbacks {
+            system::mapped_fallbacks()
+        } else {
+            &[]
+        };
+        #[cfg(windows)]
+        {
+            self.definitions_mapped(fallbacks, interface)
+        }
+        #[cfg(not(windows))]
+        {
+            let fallbacks = if self.system_fallbacks {
+                system::fallbacks()
+            } else {
+                &[]
+            };
+            self.definitions_with(fallbacks, interface)
+        }
+    }
+
+    #[cfg(windows)]
+    fn definitions_mapped(
+        &self,
+        fallbacks: &'static [system::MappedFallback],
+        interface: Option<&'static system::Interface>,
+    ) -> FontDefinitions {
+        let mut fonts = self.definitions_with(&[], interface);
+        {
+            let realign = interface.map_or(0.0, |interface| {
+                let regular = interface.face(Weight::Regular);
+                system::baseline_center(regular.bytes, regular.index)
+                    .map_or(0.0, |center| center - system::INTER_BASELINE_CENTER)
+            });
+            for loaded in fallbacks {
+                let fallback = &loaded.face;
+                let mut data = FontData::from_static(loaded.bytes());
+                data.index = fallback.index;
+                data.tweak.scale = fallback.scale;
+                data.tweak.y_offset_factor = fallback.y_offset_factor + realign;
+                fonts
+                    .font_data
+                    .insert(fallback.name.clone(), Arc::new(data));
+                for family in fonts.families.values_mut() {
+                    family.push(fallback.name.clone());
+                }
+            }
+        }
+        fonts
     }
 
     /// [`Self::definitions`] with the system fallbacks and the platform's
@@ -359,6 +402,28 @@ fn inter_face(_weight: Weight) -> Option<FontData> {
 #[cfg(test)]
 mod system_primary_tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn mapped_and_owned_fallbacks_produce_identical_font_definitions() {
+        let loaded = system::MappedFallback::from_found(system::Found {
+            script: "yi",
+            bytes: include_bytes!("../tests/fixtures/yi/YiTallLineGap.ttf").to_vec(),
+            index: 0,
+            path: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/yi/YiTallLineGap.ttf"),
+        });
+        let mapped = Box::leak(Box::new([loaded]));
+        let owned = system::tests_support::tall_yi_fallback();
+        let setup = FontSetup::default();
+        for interface in [None, Some(stand_in())] {
+            assert_eq!(
+                setup.definitions_mapped(mapped, interface),
+                setup.definitions_with(owned, interface),
+                "family order, font bytes, face indices and rendering tweaks stay identical"
+            );
+        }
+    }
 
     /// Inter's file, read as a system face would be, standing in for San
     /// Francisco or Segoe UI.
