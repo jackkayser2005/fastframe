@@ -238,10 +238,48 @@ pub(crate) fn map(path: &Path) -> Option<memmap2::Mmap> {
 /// every window installs them. Mapping instead of reading means the process
 /// holds only the pages it draws from, as clean file-backed memory the system
 /// can drop and reload: a Hangul fallback is a 55 MB collection on macOS.
-/// A font file truncated in place while the app runs could fault on a later
-/// glyph; package managers and font installers replace files instead.
+/// Windows retains a read handle denying in-place writes. Other platforms
+/// rely on font installers replacing files instead of truncating them; an
+/// in-place truncation there could fault on a later glyph.
 pub(crate) fn map_for_life(path: &Path) -> Option<&'static [u8]> {
-    Some(Box::leak(Box::new(map(path)?)))
+    #[cfg(windows)]
+    {
+        Some(&Box::leak(Box::new(LockedFont::open(path)?)).bytes)
+    }
+    #[cfg(not(windows))]
+    {
+        Some(Box::leak(Box::new(map(path)?)))
+    }
+}
+
+#[cfg(windows)]
+struct LockedFont {
+    bytes: memmap2::Mmap,
+    // Keep sharing restrictions until after the borrowed view is unmapped.
+    _file: std::fs::File,
+}
+
+#[cfg(windows)]
+impl LockedFont {
+    #[allow(
+        unsafe_code,
+        reason = "a retained read-only file mapping avoids font copies while denying in-place writes"
+    )]
+    fn open(path: &Path) -> Option<Self> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            // FILE_SHARE_READ | FILE_SHARE_DELETE. Allow path replacement,
+            // but keep in-place writers away from the borrowed font bytes.
+            .share_mode(0x1 | 0x4)
+            .open(path)
+            .ok()?;
+        // SAFETY: the read-only view retains its file handle, which denies
+        // existing and future in-place writers for the mapping's lifetime.
+        // Replacing the path leaves this file object and view unchanged.
+        let bytes = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+        Some(Self { bytes, _file: file })
+    }
 }
 
 /// Inter's baseline measured from the centre of its line box, in ems:
@@ -1081,6 +1119,41 @@ mod tests {
         let bytes = map_for_life(&path).unwrap();
         assert_eq!(bytes, include_bytes!("../tests/fixtures/yi/YiTest.ttf"));
         assert!(map_for_life(Path::new("/no/such/font.ttf")).is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn persistent_windows_mapping_denies_writers_and_keeps_replaced_file_bytes() {
+        let temporary = tempfile::tempdir().expect("font directory");
+        let path = temporary.path().join("fixture.ttf");
+        let retired = temporary.path().join("retired.ttf");
+        let bytes = include_bytes!("../tests/fixtures/yi/YiTest.ttf");
+        std::fs::write(&path, bytes).unwrap();
+
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(
+            LockedFont::open(&path).is_none(),
+            "an existing writer is unsafe"
+        );
+        drop(writer);
+        let loaded = LockedFont::open(&path).expect("immutable font mapping");
+        assert_eq!(loaded.bytes.as_ref(), bytes);
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+
+        std::fs::rename(&path, &retired).expect("path replacement remains allowed");
+        std::fs::write(&path, b"replacement").unwrap();
+        assert_eq!(
+            loaded.bytes.as_ref(),
+            bytes,
+            "the original file stays mapped"
+        );
+        drop(loaded);
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&retired)
+                .is_ok()
+        );
     }
 
     #[test]
