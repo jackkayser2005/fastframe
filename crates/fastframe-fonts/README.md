@@ -76,6 +76,13 @@ fonts.
 `fastframe_fonts::system::fallbacks()` finds the faces once per process and
 reuses them for every window.
 
+Selected fallback files are memory-mapped for the process lifetime, following
+upstream fastframe #17. Font selection, metrics and family order are unchanged.
+On Windows the retained read handles deny in-place writes while permitting path
+replacement, so borrowed slices keep reading the original file. Close the app
+if a font updater needs to rewrite an in-use file in place. Mapping avoids
+private copies of complete files; used pages can still remain resident.
+
 | Platform | How the face is chosen |
 | --- | --- |
 | macOS | CoreText names the face it draws each script with, in the language the user reads, and its cascade behind it. Faces epaint cannot draw (Apple's `hvgl` outlines in `PingFangUI.ttc`) are skipped for the next in the cascade. |
